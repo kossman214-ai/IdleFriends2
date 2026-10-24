@@ -1,77 +1,139 @@
-import { connectLambda, getStore } from "@netlify/blobs";
+import { connectLambda, getStore } from '@netlify/blobs';
 
-export const handler = async (event) => {
+const STORE_NAME = 'idle-friends-2-shared';
+const KEY = 'presence-v1';
+const TTL_MS = 45_000;
+const ADMIN_NAME = 'test123';
+
+const cleanName = value => String(value ?? '').trim().slice(0, 24);
+const normName = value => cleanName(value).toLowerCase();
+
+const json = (statusCode, data) => ({
+  statusCode,
+  headers: {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store'
+  },
+  body: JSON.stringify(data)
+});
+
+const readBody = event => {
+  try { return JSON.parse(event.body || '{}'); } catch { return {}; }
+};
+
+export const handler = async event => {
   try {
     connectLambda(event);
 
-    const store = getStore({ name: "idle-friends-2-shared" });
-    const KEY = "online-players-v1";
+    const store = getStore({ name: STORE_NAME });
+    const now = Date.now();
+    const sessions = (await store.get(KEY, { type: 'json' })) ?? {};
 
-    const respond = (statusCode, data) => ({
-      statusCode,
-      headers: {
-        "content-type": "application/json",
-        "cache-control": "no-store"
-      },
-      body: JSON.stringify(data)
-    });
-
-    if (event.httpMethod === "OPTIONS") {
-      return respond(204, {});
-    }
-
-    if (event.httpMethod === "GET") {
-      const players =
-        (await store.get(KEY, { type: "json" })) ?? {};
-
-      const now = Date.now();
-      const online = Object.values(players).filter(
-        player => now - player.lastSeen < 60000
-      );
-
-      return respond(200, online);
-    }
-
-    if (event.httpMethod !== "POST") {
-      return respond(405, { error: "Method not allowed" });
-    }
-
-    let body;
-
-    try {
-      body = JSON.parse(event.body || "{}");
-    } catch {
-      return respond(400, { error: "Invalid JSON" });
-    }
-
-    const name = String(body.name ?? "").trim().slice(0, 24);
-
-    if (!name) {
-      return respond(400, { error: "Name required" });
-    }
-
-    const players =
-      (await store.get(KEY, { type: "json" })) ?? {};
-
-    const playerKey = name.toLowerCase();
-
-    players[playerKey] = {
-      name,
-      lastSeen: Date.now()
-    };
-
-    for (const [key, player] of Object.entries(players)) {
-      if (Date.now() - player.lastSeen >= 60000) {
-        delete players[key];
+    for (const [id, player] of Object.entries(sessions)) {
+      if (
+        !player ||
+        now - (Number(player.lastSeen) || 0) > TTL_MS ||
+        normName(player.name) === ADMIN_NAME
+      ) {
+        delete sessions[id];
       }
     }
 
-    await store.setJSON(KEY, players);
+    const makeList = () => {
+      const byName = new Map();
 
-    return respond(200, { ok: true });
+      for (const player of Object.values(sessions)) {
+        const key = normName(player.name);
+        const previous = byName.get(key);
+
+        if (
+          !previous ||
+          Number(player.lastSeen) > Number(previous.lastSeen)
+        ) {
+          byName.set(key, player);
+        }
+      }
+
+      return [...byName.values()].sort(
+        (a, b) => String(a.name).localeCompare(String(b.name), 'de')
+      );
+    };
+
+    if (event.httpMethod === 'OPTIONS') return json(204, {});
+
+    if (event.httpMethod === 'GET') {
+      await store.setJSON(KEY, sessions);
+      const players = makeList();
+      return json(200, { onlineCount: players.length, players });
+    }
+
+    if (event.httpMethod !== 'POST') {
+      return json(405, { error: 'Method not allowed' });
+    }
+
+    const body = readBody(event);
+    const sessionId = String(body.sessionId ?? '').trim().slice(0, 100);
+
+    if (!sessionId) {
+      return json(400, { error: 'sessionId required' });
+    }
+
+    if (body.action === 'leave' || body.action === 'delete-account') {
+      delete sessions[sessionId];
+
+      if (body.action === 'delete-account') {
+        const deletedName = normName(body.name);
+
+        if (deletedName) {
+          for (const [id, player] of Object.entries(sessions)) {
+            if (normName(player?.name) === deletedName) {
+              delete sessions[id];
+            }
+          }
+        }
+      }
+    } else {
+      const name = cleanName(body.name);
+
+      if (!name) return json(400, { error: 'name required' });
+
+      if (normName(name) === ADMIN_NAME) {
+        delete sessions[sessionId];
+      } else {
+        const stats = body.stats && typeof body.stats === 'object'
+          ? body.stats
+          : {};
+
+        sessions[sessionId] = {
+          name,
+          rebirths: Math.max(0, Number(stats.rebirths) || 0),
+          totalIncome: Math.max(0, Number(stats.totalIncome) || 0),
+          playtimeSeconds: Math.max(0, Number(stats.playtimeSeconds) || 0),
+          bestFriend: stats.bestFriend && typeof stats.bestFriend === 'object'
+            ? {
+                name: String(stats.bestFriend.name ?? 'Unbekannt').slice(0, 80),
+                rarity: String(stats.bestFriend.rarity ?? 'Normal').slice(0, 40),
+                mutations: Array.isArray(stats.bestFriend.mutations)
+                  ? stats.bestFriend.mutations.map(v => String(v).slice(0, 40)).slice(0, 8)
+                  : [],
+                income: Math.max(0, Number(stats.bestFriend.income) || 0)
+              }
+            : null,
+          lastSeen: now
+        };
+      }
+    }
+
+    await store.setJSON(KEY, sessions);
+    const players = makeList();
+
+    return json(200, {
+      ok: true,
+      onlineCount: players.length,
+      players
+    });
   } catch (error) {
-    console.error("Presence error:", error);
-
-    return respond(500, { error: "Server error" });
+    console.error('Presence function failed:', error);
+    return json(500, { error: 'Presence server error' });
   }
 };
