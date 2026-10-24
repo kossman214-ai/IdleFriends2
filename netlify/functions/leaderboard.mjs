@@ -29,18 +29,8 @@ const readBody = event => {
 
 const numeric = value => Math.max(0, Number(value) || 0);
 
-const getAdminSecret = () => String(process.env.ADMIN_SECRET || '').trim();
-
-const isAuthorizedAdmin = (event, body) => {
-  const secret = getAdminSecret();
-  if (!secret) return false;
-  const authHeader = String(event.headers?.authorization || event.headers?.Authorization || '').trim();
-  const bearer = authHeader.toLowerCase().startsWith('bearer ')
-    ? authHeader.slice(7).trim()
-    : '';
-  const fromBody = String(body?.adminSecret || body?.secret || '').trim();
-  return bearer === secret || fromBody === secret;
-};
+// Kein Passwort – Admin-Aktionen sind freigeschaltet.
+const isAuthorizedAdmin = () => true;
 
 export const handler = async event => {
   try {
@@ -124,29 +114,18 @@ export const handler = async event => {
     const action = String(body.action || '').toLowerCase();
 
     if (action === 'ban') {
-      if (!isAuthorizedAdmin(event, body)) {
-        return json(401, { error: 'Unauthorized – invalid or missing ADMIN_SECRET' });
-      }
+      if (!isAuthorizedAdmin()) return json(401, { error: 'Unauthorized' });
       const name = cleanName(body.name);
       const key = normName(name);
       if (!key) return json(400, { error: 'name required' });
-      if (key === ADMIN_NAME) {
-        return json(400, { error: 'Cannot ban the admin account' });
-      }
+      if (key === ADMIN_NAME) return json(400, { error: 'Cannot ban the admin account' });
 
       const bans = await read(BANS_KEY, {});
-      bans[key] = {
-        name: name,
-        bannedAt: Date.now(),
-        bannedBy: ADMIN_NAME
-      };
+      bans[key] = { name, bannedAt: Date.now(), bannedBy: ADMIN_NAME };
       await write(BANS_KEY, bans);
 
       const rows = await read(LEADERBOARD_KEY, []);
-      await write(
-        LEADERBOARD_KEY,
-        rows.filter(row => normName(row?.name) !== key)
-      );
+      await write(LEADERBOARD_KEY, rows.filter(row => normName(row?.name) !== key));
 
       const names = await read(NAMES_KEY, {});
       delete names[key];
@@ -158,34 +137,22 @@ export const handler = async event => {
       }
       await write(PRESENCE_KEY, sessions);
 
-      return json(200, {
-        action: 'ban',
-        banned: true,
-        banVersion: 2,
-        name: name,
-        ok: true
-      });
+      return json(200, { action: 'ban', banned: true, banVersion: 2, name, ok: true });
     }
 
     if (action === 'unban') {
-      if (!isAuthorizedAdmin(event, body)) {
-        return json(401, { error: 'Unauthorized – invalid or missing ADMIN_SECRET' });
-      }
+      if (!isAuthorizedAdmin()) return json(401, { error: 'Unauthorized' });
       const name = cleanName(body.name);
       const key = normName(name);
       if (!key) return json(400, { error: 'name required' });
-
       const bans = await read(BANS_KEY, {});
       delete bans[key];
       await write(BANS_KEY, bans);
-
       return json(200, { action: 'unban', ok: true, name });
     }
 
     if (action === 'set-event' || action === 'clear-event') {
-      if (!isAuthorizedAdmin(event, body)) {
-        return json(401, { error: 'Unauthorized – invalid or missing ADMIN_SECRET' });
-      }
+      if (!isAuthorizedAdmin()) return json(401, { error: 'Unauthorized' });
 
       if (action === 'clear-event') {
         await write(GLOBAL_EVENT_KEY, null);
@@ -228,9 +195,7 @@ export const handler = async event => {
     const names = await read(NAMES_KEY, {});
 
     if (body.action === 'register') {
-      if (names[key]) {
-        return json(409, { error: 'name already registered' });
-      }
+      if (names[key]) return json(409, { error: 'name already registered' });
       names[key] = name;
       await write(NAMES_KEY, names);
       return json(201, { ok: true });
