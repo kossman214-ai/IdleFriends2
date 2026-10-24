@@ -14,3 +14,13 @@
   from = "/api/presence"
   to = "/.netlify/functions/presence"
   status = 200
+
+[[redirects]]
+  from = "/api/reset-data"
+  to = "/.netlify/functions/reset-data"
+  status = 200
+
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
