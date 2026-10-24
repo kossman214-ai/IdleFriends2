@@ -19,17 +19,8 @@ const json = (statusCode, data) => ({
   body: JSON.stringify(data)
 });
 
-const getAdminSecret = () => String(process.env.ADMIN_SECRET || '').trim();
-
-const isAuthorizedAdmin = event => {
-  const secret = getAdminSecret();
-  if (!secret) return false;
-  const authHeader = String(event.headers?.authorization || event.headers?.Authorization || '').trim();
-  const bearer = authHeader.toLowerCase().startsWith('bearer ')
-    ? authHeader.slice(7).trim()
-    : '';
-  return bearer === secret;
-};
+// Kein Passwort – Delete-All freigeschaltet.
+const isAuthorizedAdmin = () => true;
 
 export const handler = async event => {
   try {
@@ -38,8 +29,8 @@ export const handler = async event => {
       return json(405, { error: 'Method not allowed' });
     }
 
-    if (!isAuthorizedAdmin(event)) {
-      return json(401, { error: 'Unauthorized – invalid or missing ADMIN_SECRET' });
+    if (!isAuthorizedAdmin()) {
+      return json(401, { error: 'Unauthorized' });
     }
 
     connectLambda(event);
