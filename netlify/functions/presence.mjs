@@ -2,8 +2,9 @@ import { connectLambda, getStore } from '@netlify/blobs';
 
 const STORE_NAME = 'idle-friends-2-shared';
 const KEY = 'presence-v1';
+const BANS_KEY = 'bans-v1';
 const TTL_MS = 45_000;
-const ADMIN_NAME = 'test123';
+const ADMIN_NAME = 'maxtest';
 
 const cleanName = value => String(value ?? '').trim().slice(0, 24);
 const normName = value => cleanName(value).toLowerCase();
@@ -12,7 +13,10 @@ const json = (statusCode, data) => ({
   statusCode,
   headers: {
     'content-type': 'application/json; charset=utf-8',
-    'cache-control': 'no-store'
+    'cache-control': 'no-store',
+    'access-control-allow-origin': '*',
+    'access-control-allow-headers': 'Content-Type, Authorization',
+    'access-control-allow-methods': 'GET, POST, OPTIONS'
   },
   body: JSON.stringify(data)
 });
@@ -28,12 +32,15 @@ export const handler = async event => {
     const store = getStore({ name: STORE_NAME });
     const now = Date.now();
     const sessions = (await store.get(KEY, { type: 'json' })) ?? {};
+    const bans = (await store.get(BANS_KEY, { type: 'json' })) ?? {};
 
     for (const [id, player] of Object.entries(sessions)) {
+      const playerKey = normName(player?.name);
       if (
         !player ||
         now - (Number(player.lastSeen) || 0) > TTL_MS ||
-        normName(player.name) === ADMIN_NAME
+        playerKey === ADMIN_NAME ||
+        bans[playerKey]
       ) {
         delete sessions[id];
       }
@@ -41,19 +48,14 @@ export const handler = async event => {
 
     const makeList = () => {
       const byName = new Map();
-
       for (const player of Object.values(sessions)) {
         const key = normName(player.name);
+        if (bans[key] || key === ADMIN_NAME) continue;
         const previous = byName.get(key);
-
-        if (
-          !previous ||
-          Number(player.lastSeen) > Number(previous.lastSeen)
-        ) {
+        if (!previous || Number(player.lastSeen) > Number(previous.lastSeen)) {
           byName.set(key, player);
         }
       }
-
       return [...byName.values()].sort(
         (a, b) => String(a.name).localeCompare(String(b.name), 'de')
       );
@@ -83,7 +85,6 @@ export const handler = async event => {
 
       if (body.action === 'delete-account') {
         const deletedName = normName(body.name);
-
         if (deletedName) {
           for (const [id, player] of Object.entries(sessions)) {
             if (normName(player?.name) === deletedName) {
@@ -94,15 +95,26 @@ export const handler = async event => {
       }
     } else {
       const name = cleanName(body.name);
-
       if (!name) return json(400, { error: 'name required' });
 
-      if (normName(name) === ADMIN_NAME) {
+      const key = normName(name);
+
+      if (bans[key]) {
+        delete sessions[sessionId];
+        await store.setJSON(KEY, sessions);
+        return json(403, {
+          error: 'banned',
+          banned: true,
+          message: 'Dieses Konto wurde gesperrt.',
+          onlineCount: makeList().length,
+          players: makeList()
+        });
+      }
+
+      if (key === ADMIN_NAME) {
         delete sessions[sessionId];
       } else {
-        const stats = body.stats && typeof body.stats === 'object'
-          ? body.stats
-          : {};
+        const stats = body.stats && typeof body.stats === 'object' ? body.stats : {};
 
         sessions[sessionId] = {
           name,
