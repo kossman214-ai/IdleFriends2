@@ -1,9 +1,12 @@
 import { connectLambda, getStore } from '@netlify/blobs';
 
 const STORE_NAME = 'idle-friends-2-shared';
-const KEY = 'presence-v1';
+const LEADERBOARD_KEY = 'leaderboard-v1';
+const NAMES_KEY = 'registered-names-v1';
+const PRESENCE_KEY = 'presence-v1';
 const BANS_KEY = 'bans-v1';
-const TTL_MS = 45_000;
+const GLOBAL_EVENT_KEY = 'global-event-v1';
+const GLOBAL_SPAWNS_KEY = 'global-spawns-v1';
 const ADMIN_NAME = 'maxtest';
 
 const cleanName = value => String(value ?? '').trim().slice(0, 24);
@@ -16,7 +19,7 @@ const json = (statusCode, data) => ({
     'cache-control': 'no-store',
     'access-control-allow-origin': '*',
     'access-control-allow-headers': 'Content-Type, Authorization',
-    'access-control-allow-methods': 'GET, POST, OPTIONS'
+    'access-control-allow-methods': 'GET, POST, DELETE, OPTIONS'
   },
   body: JSON.stringify(data)
 });
@@ -25,127 +28,277 @@ const readBody = event => {
   try { return JSON.parse(event.body || '{}'); } catch { return {}; }
 };
 
+const numeric = value => Math.max(0, Number(value) || 0);
+
+// Kein Passwort – Admin-Aktionen sind freigeschaltet.
+const isAuthorizedAdmin = () => true;
+
 export const handler = async event => {
   try {
     connectLambda(event);
-
     const store = getStore({ name: STORE_NAME });
-    const now = Date.now();
-    const sessions = (await store.get(KEY, { type: 'json' })) ?? {};
-    const bans = (await store.get(BANS_KEY, { type: 'json' })) ?? {};
+    const method = event.httpMethod;
 
-    for (const [id, player] of Object.entries(sessions)) {
-      const playerKey = normName(player?.name);
-      if (
-        !player ||
-        now - (Number(player.lastSeen) || 0) > TTL_MS ||
-        playerKey === ADMIN_NAME ||
-        bans[playerKey]
-      ) {
-        delete sessions[id];
+    const read = async (key, fallback) =>
+      (await store.get(key, { type: 'json' })) ?? fallback;
+    const write = async (key, value) => store.setJSON(key, value);
+
+    if (method === 'OPTIONS') return json(204, {});
+
+    if (method === 'GET') {
+      const qs = event.queryStringParameters || {};
+      const requestedName = cleanName(qs.name);
+
+      // Globale Admin-Spawns abrufen: jeder Client pollt mit seinem letzten Event-Cursor.
+      if (qs.globalSpawns === '1') {
+        const since = Math.max(0, Number(qs.since) || 0);
+        const events = await read(GLOBAL_SPAWNS_KEY, []);
+        return json(200, {
+          events: events.filter(item => Number(item?.id) > since).slice(0, 100)
+        });
       }
+
+      if (qs.banCheck) {
+        const bans = await read(BANS_KEY, {});
+        const rows = await read(LEADERBOARD_KEY, []);
+        const safeRows = rows.filter(row => {
+          const n = normName(row?.name);
+          return n && n !== ADMIN_NAME && !bans[n];
+        });
+        safeRows.sort((a, b) => numeric(b.rebirths) - numeric(a.rebirths));
+        return json(200, safeRows.slice(0, 500));
+      }
+
+      if (requestedName) {
+        const names = await read(NAMES_KEY, {});
+        const bans = await read(BANS_KEY, {});
+        const key = normName(requestedName);
+        return json(200, {
+          registered: Boolean(names[key]),
+          banned: Boolean(bans[key])
+        });
+      }
+
+      if (qs.event === '1' || qs.globalEvent === '1') {
+        const globalEvent = await read(GLOBAL_EVENT_KEY, null);
+        return json(200, { event: globalEvent });
+      }
+
+      const bans = await read(BANS_KEY, {});
+      const rows = await read(LEADERBOARD_KEY, []);
+      const safeRows = rows.filter(row => {
+        const n = normName(row?.name);
+        return n && n !== ADMIN_NAME && !bans[n];
+      });
+
+      safeRows.sort((a, b) => numeric(b.rebirths) - numeric(a.rebirths));
+      return json(200, safeRows.slice(0, 500));
     }
 
-    const makeList = () => {
-      const byName = new Map();
-      for (const player of Object.values(sessions)) {
-        const key = normName(player.name);
-        if (bans[key] || key === ADMIN_NAME) continue;
-        const previous = byName.get(key);
-        if (!previous || Number(player.lastSeen) > Number(previous.lastSeen)) {
-          byName.set(key, player);
-        }
+    if (method === 'DELETE') {
+      const name = cleanName(event.queryStringParameters?.name);
+      const key = normName(name);
+      if (!key) return json(400, { error: 'name required' });
+
+      const rows = await read(LEADERBOARD_KEY, []);
+      await write(LEADERBOARD_KEY, rows.filter(row => normName(row?.name) !== key));
+
+      const names = await read(NAMES_KEY, {});
+      delete names[key];
+      await write(NAMES_KEY, names);
+
+      const sessions = await read(PRESENCE_KEY, {});
+      for (const [id, player] of Object.entries(sessions)) {
+        if (normName(player?.name) === key) delete sessions[id];
       }
-      return [...byName.values()].sort(
-        (a, b) => String(a.name).localeCompare(String(b.name), 'de')
-      );
-    };
+      await write(PRESENCE_KEY, sessions);
 
-    if (event.httpMethod === 'OPTIONS') return json(204, {});
-
-    if (event.httpMethod === 'GET') {
-      await store.setJSON(KEY, sessions);
-      const players = makeList();
-      return json(200, { onlineCount: players.length, players });
+      return json(200, { ok: true, deleted: name });
     }
 
-    if (event.httpMethod !== 'POST') {
+    if (method !== 'POST') {
       return json(405, { error: 'Method not allowed' });
     }
 
     const body = readBody(event);
-    const sessionId = String(body.sessionId ?? '').trim().slice(0, 100);
+    const action = String(body.action || '').toLowerCase();
 
-    if (!sessionId) {
-      return json(400, { error: 'sessionId required' });
-    }
-
-    if (body.action === 'leave' || body.action === 'delete-account') {
-      delete sessions[sessionId];
-
-      if (body.action === 'delete-account') {
-        const deletedName = normName(body.name);
-        if (deletedName) {
-          for (const [id, player] of Object.entries(sessions)) {
-            if (normName(player?.name) === deletedName) {
-              delete sessions[id];
-            }
-          }
-        }
-      }
-    } else {
-      const name = cleanName(body.name);
-      if (!name) return json(400, { error: 'name required' });
-
-      const key = normName(name);
-
-      if (bans[key]) {
-        delete sessions[sessionId];
-        await store.setJSON(KEY, sessions);
-        return json(403, {
-          error: 'banned',
-          banned: true,
-          message: 'Dieses Konto wurde gesperrt.',
-          onlineCount: makeList().length,
-          players: makeList()
-        });
+    // Globale Spawns werden serverseitig gespeichert und von allen aktiven Clients abgeholt.
+    // Nur das Admin-Konto darf diese Aktionen auslösen.
+    if (action === 'spawn-friend' || action === 'spawn-friends') {
+      if (normName(body.adminName) !== ADMIN_NAME) {
+        return json(401, { error: 'Unauthorized admin spawn' });
       }
 
-      if (key === ADMIN_NAME) {
-        delete sessions[sessionId];
-      } else {
-        const stats = body.stats && typeof body.stats === 'object' ? body.stats : {};
+      const incoming = action === 'spawn-friends'
+        ? (Array.isArray(body.friends) ? body.friends : [])
+        : [{ ...(body.friend || {}), mutations: body.mutations }];
 
-        sessions[sessionId] = {
+      if (!incoming.length) return json(400, { error: 'No friends supplied' });
+
+      const cleanFriend = item => {
+        const friend = item && typeof item === 'object' ? item : {};
+        const name = String(friend.name ?? '').trim().slice(0, 80);
+        if (!name) return null;
+        return {
           name,
-          rebirths: Math.max(0, Number(stats.rebirths) || 0),
-          totalIncome: Math.max(0, Number(stats.totalIncome) || 0),
-          playtimeSeconds: Math.max(0, Number(stats.playtimeSeconds) || 0),
-          bestFriend: stats.bestFriend && typeof stats.bestFriend === 'object'
-            ? {
-                name: String(stats.bestFriend.name ?? 'Unbekannt').slice(0, 80),
-                rarity: String(stats.bestFriend.rarity ?? 'Normal').slice(0, 40),
-                mutations: Array.isArray(stats.bestFriend.mutations)
-                  ? stats.bestFriend.mutations.map(v => String(v).slice(0, 40)).slice(0, 8)
-                  : [],
-                income: Math.max(0, Number(stats.bestFriend.income) || 0)
-              }
-            : null,
-          lastSeen: now
+          rarity: String(friend.rarity ?? 'Normal').slice(0, 40),
+          value: numeric(friend.value),
+          cost: numeric(friend.cost),
+          mutations: Array.isArray(friend.mutations)
+            ? friend.mutations.map(value => String(value).slice(0, 40)).slice(0, 8)
+            : []
         };
-      }
+      };
+
+      const friends = incoming.map(cleanFriend).filter(Boolean).slice(0, 200);
+      if (!friends.length) return json(400, { error: 'No valid friends supplied' });
+
+      const events = await read(GLOBAL_SPAWNS_KEY, []);
+      const baseId = Date.now() * 1000;
+      const added = friends.map((friend, index) => ({
+        id: baseId + index,
+        createdAt: Date.now(),
+        friend: {
+          name: friend.name,
+          rarity: friend.rarity,
+          value: friend.value,
+          cost: friend.cost
+        },
+        mutations: friend.mutations
+      }));
+      const nextEvents = [...events, ...added].slice(-300);
+      await write(GLOBAL_SPAWNS_KEY, nextEvents);
+      return json(200, { ok: true, action, published: added.length });
     }
 
-    await store.setJSON(KEY, sessions);
-    const players = makeList();
+    if (action === 'ban') {
+      if (!isAuthorizedAdmin()) return json(401, { error: 'Unauthorized' });
+      const name = cleanName(body.name);
+      const key = normName(name);
+      if (!key) return json(400, { error: 'name required' });
+      if (key === ADMIN_NAME) return json(400, { error: 'Cannot ban the admin account' });
 
-    return json(200, {
-      ok: true,
-      onlineCount: players.length,
-      players
-    });
+      const bans = await read(BANS_KEY, {});
+      bans[key] = { name, bannedAt: Date.now(), bannedBy: ADMIN_NAME };
+      await write(BANS_KEY, bans);
+
+      const rows = await read(LEADERBOARD_KEY, []);
+      await write(LEADERBOARD_KEY, rows.filter(row => normName(row?.name) !== key));
+
+      const names = await read(NAMES_KEY, {});
+      delete names[key];
+      await write(NAMES_KEY, names);
+
+      const sessions = await read(PRESENCE_KEY, {});
+      for (const [id, player] of Object.entries(sessions)) {
+        if (normName(player?.name) === key) delete sessions[id];
+      }
+      await write(PRESENCE_KEY, sessions);
+
+      return json(200, { action: 'ban', banned: true, banVersion: 2, name, ok: true });
+    }
+
+    if (action === 'unban') {
+      if (!isAuthorizedAdmin()) return json(401, { error: 'Unauthorized' });
+      const name = cleanName(body.name);
+      const key = normName(name);
+      if (!key) return json(400, { error: 'name required' });
+      const bans = await read(BANS_KEY, {});
+      delete bans[key];
+      await write(BANS_KEY, bans);
+      return json(200, { action: 'unban', ok: true, name });
+    }
+
+    if (action === 'set-event' || action === 'clear-event') {
+      if (!isAuthorizedAdmin()) return json(401, { error: 'Unauthorized' });
+
+      if (action === 'clear-event') {
+        await write(GLOBAL_EVENT_KEY, null);
+        return json(200, { action: 'clear-event', ok: true, event: null });
+      }
+
+      const label = String(body.label || body.eventLabel || 'Admin-Event').slice(0, 120);
+      const luckMult = Math.max(0, Number(body.luckMult) || 0);
+      const incomeMult = Math.max(1, Number(body.incomeMult) || 1);
+      const durationMinutes = Math.max(0, Number(body.durationMinutes) || 0);
+      const endsAt = durationMinutes > 0 ? Date.now() + durationMinutes * 60 * 1000 : null;
+
+      const globalEvent = {
+        active: true,
+        label,
+        luckMult,
+        incomeMult,
+        startedAt: Date.now(),
+        endsAt,
+        setBy: ADMIN_NAME
+      };
+      await write(GLOBAL_EVENT_KEY, globalEvent);
+      return json(200, { action: 'set-event', ok: true, event: globalEvent });
+    }
+
+    const name = cleanName(body.name);
+    const key = normName(name);
+    if (!key) return json(400, { error: 'name required' });
+    if (key === ADMIN_NAME) return json(200, { ok: true, ignored: true });
+
+    const bans = await read(BANS_KEY, {});
+    if (bans[key]) {
+      return json(403, {
+        error: 'banned',
+        banned: true,
+        message: 'Dieses Konto wurde gesperrt.'
+      });
+    }
+
+    const names = await read(NAMES_KEY, {});
+
+    if (body.action === 'register') {
+      if (names[key]) return json(409, { error: 'name already registered' });
+      names[key] = name;
+      await write(NAMES_KEY, names);
+      return json(201, { ok: true });
+    }
+
+    if (names[key] && names[key] !== name) {
+      return json(409, { error: 'name already registered' });
+    }
+
+    if (!names[key]) {
+      names[key] = name;
+      await write(NAMES_KEY, names);
+    }
+
+    const rows = await read(LEADERBOARD_KEY, []);
+
+    const best = body.bestFriend && typeof body.bestFriend === 'object'
+      ? {
+          name: String(body.bestFriend.name ?? 'Unbekannt').slice(0, 80),
+          rarity: String(body.bestFriend.rarity ?? 'Normal').slice(0, 40),
+          mutations: Array.isArray(body.bestFriend.mutations)
+            ? body.bestFriend.mutations.map(v => String(v).slice(0, 40)).slice(0, 8)
+            : [],
+          income: numeric(body.bestFriend.income)
+        }
+      : null;
+
+    const record = {
+      name: names[key],
+      rebirths: numeric(body.rebirths),
+      bestFriend: best,
+      totalIncome: numeric(body.totalIncome),
+      playtimeSeconds: numeric(body.playtimeSeconds),
+      updatedAt: Date.now()
+    };
+
+    const index = rows.findIndex(row => normName(row?.name) === key);
+    if (index >= 0) rows[index] = record;
+    else rows.push(record);
+
+    await write(LEADERBOARD_KEY, rows);
+    return json(200, { ok: true });
   } catch (error) {
-    console.error('Presence function failed:', error);
-    return json(500, { error: 'Presence server error' });
+    console.error('Leaderboard function failed:', error);
+    return json(500, { error: 'Leaderboard server error' });
   }
 };
