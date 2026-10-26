@@ -6,6 +6,7 @@ const NAMES_KEY = 'registered-names-v1';
 const PRESENCE_KEY = 'presence-v1';
 const BANS_KEY = 'bans-v1';
 const GLOBAL_EVENT_KEY = 'global-event-v1';
+const GLOBAL_SPAWNS_KEY = 'global-spawns-v1';
 const ADMIN_NAME = 'maxtest';
 
 const cleanName = value => String(value ?? '').trim().slice(0, 24);
@@ -47,6 +48,15 @@ export const handler = async event => {
     if (method === 'GET') {
       const qs = event.queryStringParameters || {};
       const requestedName = cleanName(qs.name);
+
+      // Globale Admin-Spawns abrufen: jeder Client pollt mit seinem letzten Event-Cursor.
+      if (qs.globalSpawns === '1') {
+        const since = Math.max(0, Number(qs.since) || 0);
+        const events = await read(GLOBAL_SPAWNS_KEY, []);
+        return json(200, {
+          events: events.filter(item => Number(item?.id) > since).slice(0, 100)
+        });
+      }
 
       if (qs.banCheck) {
         const bans = await read(BANS_KEY, {});
@@ -112,6 +122,55 @@ export const handler = async event => {
 
     const body = readBody(event);
     const action = String(body.action || '').toLowerCase();
+
+    // Globale Spawns werden serverseitig gespeichert und von allen aktiven Clients abgeholt.
+    // Nur das Admin-Konto darf diese Aktionen auslösen.
+    if (action === 'spawn-friend' || action === 'spawn-friends') {
+      if (normName(body.adminName) !== ADMIN_NAME) {
+        return json(401, { error: 'Unauthorized admin spawn' });
+      }
+
+      const incoming = action === 'spawn-friends'
+        ? (Array.isArray(body.friends) ? body.friends : [])
+        : [{ ...(body.friend || {}), mutations: body.mutations }];
+
+      if (!incoming.length) return json(400, { error: 'No friends supplied' });
+
+      const cleanFriend = item => {
+        const friend = item && typeof item === 'object' ? item : {};
+        const name = String(friend.name ?? '').trim().slice(0, 80);
+        if (!name) return null;
+        return {
+          name,
+          rarity: String(friend.rarity ?? 'Normal').slice(0, 40),
+          value: numeric(friend.value),
+          cost: numeric(friend.cost),
+          mutations: Array.isArray(friend.mutations)
+            ? friend.mutations.map(value => String(value).slice(0, 40)).slice(0, 8)
+            : []
+        };
+      };
+
+      const friends = incoming.map(cleanFriend).filter(Boolean).slice(0, 200);
+      if (!friends.length) return json(400, { error: 'No valid friends supplied' });
+
+      const events = await read(GLOBAL_SPAWNS_KEY, []);
+      const baseId = Date.now() * 1000;
+      const added = friends.map((friend, index) => ({
+        id: baseId + index,
+        createdAt: Date.now(),
+        friend: {
+          name: friend.name,
+          rarity: friend.rarity,
+          value: friend.value,
+          cost: friend.cost
+        },
+        mutations: friend.mutations
+      }));
+      const nextEvents = [...events, ...added].slice(-300);
+      await write(GLOBAL_SPAWNS_KEY, nextEvents);
+      return json(200, { ok: true, action, published: added.length });
+    }
 
     if (action === 'ban') {
       if (!isAuthorizedAdmin()) return json(401, { error: 'Unauthorized' });
