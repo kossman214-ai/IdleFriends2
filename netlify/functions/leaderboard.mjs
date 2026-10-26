@@ -7,6 +7,7 @@ const PRESENCE_KEY = 'presence-v1';
 const BANS_KEY = 'bans-v1';
 const GLOBAL_EVENT_KEY = 'global-event-v1';
 const GLOBAL_SPAWNS_KEY = 'global-spawns-v1';
+const ADMIN_MESSAGES_KEY = 'admin-messages-v1';
 const ADMIN_NAME = 'maxtest';
 
 const cleanName = value => String(value ?? '').trim().slice(0, 24);
@@ -30,7 +31,7 @@ const readBody = event => {
 
 const numeric = value => Math.max(0, Number(value) || 0);
 
-// Kein Passwort – Admin-Aktionen sind freigeschaltet.
+// Kein Passwort â Admin-Aktionen sind freigeschaltet.
 const isAuthorizedAdmin = () => true;
 
 export const handler = async event => {
@@ -48,6 +49,13 @@ export const handler = async event => {
     if (method === 'GET') {
       const qs = event.queryStringParameters || {};
       const requestedName = cleanName(qs.name);
+
+      // Globale Admin-Nachrichten abrufen; jeder Client fragt nur neue Nachrichten ab.
+      if (qs.adminMessages === '1') {
+        const since = Math.max(0, Number(qs.since) || 0);
+        const messages = await read(ADMIN_MESSAGES_KEY, []);
+        return json(200, { messages: messages.filter(item => Number(item?.id) > since).slice(0, 50) });
+      }
 
       // Globale Admin-Spawns abrufen: jeder Client pollt mit seinem letzten Event-Cursor.
       if (qs.globalSpawns === '1') {
@@ -123,8 +131,19 @@ export const handler = async event => {
     const body = readBody(event);
     const action = String(body.action || '').toLowerCase();
 
+    // Admin-Nachrichten serverseitig speichern und global an alle Clients verteilen.
+    if (action === 'send-admin-message') {
+      if (normName(body.adminName) !== ADMIN_NAME) return json(401, { error: 'Unauthorized admin message' });
+      const message = String(body.message ?? '').trim().slice(0, 300);
+      if (!message) return json(400, { error: 'Message required' });
+      const messages = await read(ADMIN_MESSAGES_KEY, []);
+      const item = { id: Date.now() * 1000, createdAt: Date.now(), sender: 'Admin', message };
+      await write(ADMIN_MESSAGES_KEY, [...messages, item].slice(-100));
+      return json(200, { ok: true, id: item.id });
+    }
+
     // Globale Spawns werden serverseitig gespeichert und von allen aktiven Clients abgeholt.
-    // Nur das Admin-Konto darf diese Aktionen auslösen.
+    // Nur das Admin-Konto darf diese Aktionen auslÃ¶sen.
     if (action === 'spawn-friend' || action === 'spawn-friends') {
       if (normName(body.adminName) !== ADMIN_NAME) {
         return json(401, { error: 'Unauthorized admin spawn' });
